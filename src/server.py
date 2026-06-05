@@ -131,6 +131,134 @@ def _scan_one(sym: str, today: str) -> dict:
     }
 
 
+# ─── Statement formatter ────────────────────────────────────
+
+def _fmt_statement(sym: str) -> str:
+    """Fetch income statement and format as markdown with YoY and QoQ."""
+    tk = yf.Ticker(f"{sym}.BK")
+    q_df = tk.quarterly_income_stmt
+    a_df = tk.income_stmt
+
+    if (q_df is None or q_df.empty) and (a_df is None or a_df.empty):
+        return f"ไม่พบข้อมูลงบการเงินของ {sym}"
+
+    def safe(df, row, col):
+        try:
+            v = df.loc[row, col]
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    def to_m(v):
+        return round(v / 1e6, 1) if v is not None else None
+
+    def fmt_ni(v):
+        if v is None:
+            return "—"
+        return f"({abs(v):,.1f})" if v < 0 else f"{v:,.1f}"
+
+    def fmt_eps(v):
+        return "—" if v is None else f"{v:.2f}"
+
+    def change(curr, prev):
+        if curr is None or prev is None or prev == 0:
+            return "—", "—"
+        if prev < 0 and curr >= 0:
+            return "↑", "พลิกกำไร"
+        if prev >= 0 and curr < 0:
+            return "↓", "พลิกขาดทุน"
+        pct = (curr - prev) / abs(prev) * 100
+        return ("↑" if pct >= 0 else "↓"), f"{pct:+.1f}%"
+
+    # Parse quarterly (newest first)
+    qtrs = []
+    if q_df is not None and not q_df.empty:
+        for col in q_df.columns[:7]:
+            q = (col.month - 1) // 3 + 1
+            qtrs.append({
+                "year": col.year, "q": q,
+                "ni": to_m(safe(q_df, "Net Income", col)),
+                "eps": safe(q_df, "Basic EPS", col),
+            })
+
+    # Parse annual (newest first)
+    annuals = []
+    if a_df is not None and not a_df.empty:
+        for col in a_df.columns[:5]:
+            annuals.append({
+                "year": col.year,
+                "ni": to_m(safe(a_df, "Net Income", col)),
+                "eps": safe(a_df, "Basic EPS", col),
+            })
+
+    qmap = {(d["year"], d["q"]): d for d in qtrs}
+    amap = {d["year"]: d for d in annuals}
+
+    def yoy(d):
+        prev = qmap.get((d["year"] - 1, d["q"]))
+        return change(d["ni"], prev["ni"] if prev else None)
+
+    def qoq(d):
+        pq = d["q"] - 1 if d["q"] > 1 else 4
+        py = d["year"] if d["q"] > 1 else d["year"] - 1
+        prev = qmap.get((py, pq))
+        return change(d["ni"], prev["ni"] if prev else None)
+
+    lines = [f"## {sym} — Net Income & EPS (หน่วย: ล้านบาท)", ""]
+
+    # Latest quarter summary
+    if qtrs:
+        lt = qtrs[0]
+        label = f"Q{lt['q']}/{lt['year']}"
+        ya, yp = yoy(lt)
+        qa, qp = qoq(lt)
+        lines += [
+            f"### ล่าสุด: {label}", "",
+            f"| | | | **{label}** | **EPS** |",
+            "|---|---|---|---:|---:|",
+            f"| **Net Income (M)** | {ya} | YoY {yp} | **{fmt_ni(lt['ni'])}** | **{fmt_eps(lt['eps'])}** |",
+            f"| | {qa} | QoQ {qp} | | |",
+            "",
+        ]
+
+    # Quarterly table (Q4→Q1 within each year)
+    lines += [
+        "### รายไตรมาส", "",
+        "| ไตรมาส | | YoY% | QoQ% | Net Income | EPS |",
+        "|---|---|---:|---:|---:|---:|",
+    ]
+
+    years = sorted(set(d["year"] for d in qtrs), reverse=True)
+    shown_ann = set()
+
+    for yr in years:
+        yr_qtrs = sorted([d for d in qtrs if d["year"] == yr], key=lambda x: x["q"], reverse=True)
+        lines.append(f"| **— {yr} —** | | | | | |")
+        for d in yr_qtrs:
+            ya, yp = yoy(d)
+            qa, qp = qoq(d)
+            arrow = ya if ya != "—" else qa
+            lines.append(f"| Q{d['q']} | {arrow} | {yp} | {qp} | {fmt_ni(d['ni'])} | {fmt_eps(d['eps'])} |")
+        # Annual total for this year
+        a = amap.get(yr)
+        if a:
+            prev_a = amap.get(yr - 1)
+            aa, ap = change(a["ni"], prev_a["ni"] if prev_a else None)
+            lines.append(f"| **{yr} รวมปี** | {aa} | **{ap}** | | **{fmt_ni(a['ni'])}** | **{fmt_eps(a['eps'])}** |")
+            shown_ann.add(yr)
+
+    # Annual-only years (older years with no quarterly data)
+    for a in annuals:
+        if a["year"] not in shown_ann:
+            prev_a = amap.get(a["year"] - 1)
+            aa, ap = change(a["ni"], prev_a["ni"] if prev_a else None)
+            lines.append(f"| **{a['year']} รวมปี** | {aa} | **{ap}** | | **{fmt_ni(a['ni'])}** | **{fmt_eps(a['eps'])}** |")
+
+    return "\n".join(lines)
+
+
 # ─── Tools ──────────────────────────────────────────────────
 
 @app.list_tools()
@@ -266,6 +394,25 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "default": 5,
                         "description": "จำนวนงวดย้อนหลัง"
+                    }
+                },
+                "required": ["symbol"]
+            }
+        ),
+        Tool(
+            name="get_stock_statement",
+            description=(
+                "แสดงงบกำไรขาดทุนหุ้นไทย พร้อม YoY และ QoQ ในรูปแบบตาราง\n"
+                "คืนค่า: Net Income, EPS รายไตรมาส (Q4→Q1) + รวมปี พร้อม % เปลี่ยนแปลง YoY และ QoQ\n"
+                "ใช้ tool นี้เมื่อต้องการดูภาพรวมงบกำไรขาดทุนแบบ compact\n"
+                "ใช้แทน get_income_statement เมื่อถามเรื่อง: งบหุ้น, แสดงงบ, กำไร YoY QoQ"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "สัญลักษณ์หุ้น เช่น AOT, PTT, KBANK"
                     }
                 },
                 "required": ["symbol"]
@@ -447,6 +594,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             f"SET ({len(set_syms)}): {', '.join(set_syms)}\n"
             f"mai ({len(mai_syms)}): {', '.join(mai_syms)}"
         )
+        return [TextContent(type="text", text=text)]
+
+    # ── get_stock_statement ─────────────────────────────────
+    elif name == "get_stock_statement":
+        sym = arguments["symbol"].upper()
+        text = _fmt_statement(sym)
         return [TextContent(type="text", text=text)]
 
     # ── get_income_statement ────────────────────────────────
