@@ -85,6 +85,103 @@ def _parse_history(data: dict, today: str) -> tuple[list[dict], float | None, in
     return past, today_p, today_v
 
 
+def _parse_history_ohlcv(data: dict, today: str) -> tuple[list[dict], float | None, int]:
+    """Returns (past_rows_with_high_low, today_price, today_volume)"""
+    try:
+        result = data["chart"]["result"][0]
+        meta = result["meta"]
+        timestamps = result["timestamp"]
+        q = result["indicators"]["quote"][0]
+        closes  = q["close"]
+        volumes = q["volume"]
+        highs   = q.get("high",  [None] * len(closes))
+        lows    = q.get("low",   [None] * len(closes))
+    except Exception:
+        return [], None, 0
+
+    rows = []
+    for ts, c, v, h, l in zip(timestamps, closes, volumes, highs, lows):
+        if c is None or v is None or v == 0:
+            continue
+        dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%d")
+        rows.append({
+            "dt": dt, "c": float(c), "v": int(v),
+            "h": float(h) if h else float(c),
+            "l": float(l) if l else float(c),
+        })
+
+    today_p = meta.get("regularMarketPrice") or meta.get("currentPrice")
+    today_v = int(meta.get("regularMarketVolume") or 0)
+
+    last = rows[-1] if rows else None
+    if last and last["dt"] == today:
+        past = [r for r in rows[:-1] if r["v"] > 0]
+    elif last and today_p and abs(last["c"] - today_p) / today_p < 0.03:
+        past = [r for r in rows[:-1] if r["v"] > 0]
+    else:
+        past = [r for r in rows if r["v"] > 0]
+
+    return past, today_p, today_v
+
+
+def _scan_volatile_one(sym: str, today: str) -> dict:
+    """Scan one stock for volatile-pullback-dry-volume pattern."""
+    data = _fetch_yahoo(sym)
+    if "error" in data:
+        return {"sym": sym, "status": "fetch_error"}
+
+    past, today_p, today_v = _parse_history_ohlcv(data, today)
+    if len(past) < 203:
+        return {"sym": sym, "status": "insufficient_data"}
+    if not today_p:
+        today_p = past[-1]["c"]
+
+    closes = [r["c"] for r in past]
+    ema200 = _calc_ema(closes, 200)
+    ema90  = _calc_ema(closes, 90)
+    if not ema200 or not ema90:
+        return {"sym": sym, "status": "ema_error"}
+
+    # C1: ราคา > EMA200 และ EMA90
+    if not (today_p > ema200 and today_p > ema90):
+        return {"sym": sym, "status": "fail_c1"}
+
+    # C3: ราคาลดจาก High5 > 5%
+    last5  = past[-5:]
+    high5  = max(r["c"] for r in last5)
+    drawdown_pct = (high5 - today_p) / high5 * 100
+    if drawdown_pct <= 5.0:
+        return {"sym": sym, "status": "fail_c3"}
+
+    # C2: Volume แห้ง — วันนี้ <= 30th percentile ของ 20 วัน
+    vols_20 = [r["v"] for r in past[-20:]]
+    vols_sorted = sorted(vols_20)
+    low_vol_thr = vols_sorted[int(len(vols_sorted) * 0.3)]
+    avg_vol_20  = sum(vols_20) / len(vols_20)
+    if today_v > low_vol_thr:
+        return {"sym": sym, "status": "fail_c2"}
+
+    # C4: High20 - Low20 ห่างกัน > 30%
+    last20 = past[-20:]
+    high20 = max(r["h"] for r in last20)
+    low20  = min(r["l"] for r in last20)
+    range_pct = (high20 - low20) / low20 * 100 if low20 > 0 else 0
+    if range_pct <= 30.0:
+        return {"sym": sym, "status": "fail_c4"}
+
+    vol_ratio = round(today_v / avg_vol_20 * 100, 1) if avg_vol_20 else 0
+    return {
+        "sym": sym, "status": "pass",
+        "today_p": round(today_p, 4), "today_v": today_v,
+        "ema200": round(ema200, 4), "ema90": round(ema90, 4),
+        "high5": round(high5, 4), "drawdown_pct": round(drawdown_pct, 2),
+        "avg_vol_20": int(avg_vol_20), "vol_ratio": vol_ratio,
+        "high20": round(high20, 4), "low20": round(low20, 4),
+        "range_pct": round(range_pct, 1),
+        "d_dt": past[-1]["dt"],
+    }
+
+
 def _scan_one(sym: str, today: str) -> dict:
     data = _fetch_yahoo(sym)
     if "error" in data:
@@ -283,6 +380,29 @@ def _fmt_statement(sym: str) -> str:
 async def list_tools() -> list[Tool]:
     return [
         Tool(
+            name="scan_volatile_pullback_dry_volume",
+            description=(
+                "สแกนหุ้นไทย SET/MAI ทั้งตลาด หาหุ้นขาขึ้น ผันผวนแรง พักตัว Volume แห้ง\n"
+                "เงื่อนไข 4 ข้อ:\n"
+                "  (1) ราคา > EMA200 และ > EMA90\n"
+                "  (2) Volume วันนี้ <= 30th percentile ของ 20 วันทำการล่าสุด\n"
+                "  (3) ราคาต่ำกว่า High ใน 5 วันทำการล่าสุด มากกว่า 5%\n"
+                "  (4) (High20 - Low20) / Low20 > 30%\n"
+                "คืนค่า: เรียงตาม volume แห้งสุด (% of avg) น้อยสุดขึ้นบน"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "market": {
+                        "type": "string",
+                        "enum": ["SET", "mai", "all"],
+                        "default": "all",
+                        "description": "กรองเฉพาะ SET, mai หรือ all"
+                    }
+                }
+            }
+        ),
+        Tool(
             name="scan_uptrend_pullback",
             description=(
                 "สแกนหุ้นไทย SET/MAI ทั้งตลาดหา uptrend 3-day pullback pattern\n"
@@ -473,8 +593,50 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     today = datetime.date.today().strftime("%Y-%m-%d")
 
+    # ── scan_volatile_pullback_dry_volume ───────────────────
+    if name == "scan_volatile_pullback_dry_volume":
+        import time
+        market = arguments.get("market", "all")
+        syms = _load_symbols(None if market == "all" else market)
+        t0 = time.time()
+
+        results_list = []
+        loop = asyncio.get_event_loop()
+        futures_map = {
+            loop.run_in_executor(EXECUTOR, _scan_volatile_one, sym, today): sym
+            for sym in syms
+        }
+        raw = await asyncio.gather(*futures_map.keys(), return_exceptions=True)
+        for r in raw:
+            if isinstance(r, Exception):
+                continue
+            if r["status"] == "pass":
+                results_list.append(r)
+
+        elapsed = round(time.time() - t0, 1)
+        results_list.sort(key=lambda x: x["vol_ratio"])
+
+        lines = [
+            f"สแกน {len(syms)} ตัว ใช้เวลา {elapsed}s  (today={today})",
+            f"ผ่าน 4 เงื่อนไข: {len(results_list)} ตัว — เรียงตาม Volume แห้งสุด",
+            "",
+            f"{'หุ้น':8s}  {'ราคา':>8s}  {'ลง High5':>9s}  {'Range20d':>9s}  {'Low20':>7s}  {'High20':>7s}  {'Volume':>12s}  {'%avg':>5s}",
+            "-" * 78,
+        ]
+        for r in results_list:
+            lines.append(
+                f"{r['sym']:8s}  {r['today_p']:>8.4f}  {r['drawdown_pct']:>7.1f}%  "
+                f"{r['range_pct']:>8.1f}%  {r['low20']:>7.4f}  {r['high20']:>7.4f}  "
+                f"{r['today_v']:>12,}  {r['vol_ratio']:>4.0f}%"
+            )
+            lines.append(
+                f"{'':8s}  EMA200={r['ema200']:.4f}  EMA90={r['ema90']:.4f}  ข้อมูลถึง={r['d_dt']}"
+            )
+
+        return [TextContent(type="text", text="\n".join(lines))]
+
     # ── scan_uptrend_pullback ────────────────────────────────
-    if name == "scan_uptrend_pullback":
+    elif name == "scan_uptrend_pullback":
         market = arguments.get("market", "all")
         syms = _load_symbols(None if market == "all" else market)
         import time
