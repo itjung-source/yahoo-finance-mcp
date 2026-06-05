@@ -96,7 +96,7 @@ def _scan_one(sym: str, today: str) -> dict:
         return {"sym": sym, "status": "insufficient_data"}
 
     d1, d2, d3 = past[-1], past[-2], past[-3]
-    c2 = (d3["c"] > d2["c"] + 0.0001) and (d2["c"] > d1["c"] + 0.0001)
+    c2 = (d3["c"] >= d2["c"]) and (d2["c"] >= d1["c"]) and (d3["c"] > d1["c"])
     if not c2:
         return {"sym": sym, "status": "fail_c2"}
 
