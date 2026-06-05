@@ -142,6 +142,15 @@ def _fmt_statement(sym: str) -> str:
     if (q_df is None or q_df.empty) and (a_df is None or a_df.empty):
         return f"ไม่พบข้อมูลงบการเงินของ {sym}"
 
+    # Fetch price, P/E, P/BV from info
+    try:
+        info = tk.info or {}
+    except Exception:
+        info = {}
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    pe    = info.get("trailingPE")
+    pbv   = info.get("priceToBook")
+
     def safe(df, row, col):
         try:
             v = df.loc[row, col]
@@ -161,6 +170,12 @@ def _fmt_statement(sym: str) -> str:
 
     def fmt_eps(v):
         return "—" if v is None else f"{v:.2f}"
+
+    def fmt_price(v):
+        return "—" if v is None else f"{v:,.2f}"
+
+    def fmt_ratio(v):
+        return "—" if v is None else f"{v:.2f}x"
 
     def change(curr, prev):
         if curr is None or prev is None or prev == 0:
@@ -220,6 +235,9 @@ def _fmt_statement(sym: str) -> str:
             "|---|---|---|---:|---:|",
             f"| **Net Income (M)** | {ya} | YoY {yp} | **{fmt_ni(lt['ni'])}** | **{fmt_eps(lt['eps'])}** |",
             f"| | {qa} | QoQ {qp} | | |",
+            f"| **ราคา (บาท)** | | | **{fmt_price(price)}** | |",
+            f"| **P/E** | | | **{fmt_ratio(pe)}** | |",
+            f"| **P/BV** | | | **{fmt_ratio(pbv)}** | |",
             "",
         ]
 
