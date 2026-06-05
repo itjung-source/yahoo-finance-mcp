@@ -175,7 +175,7 @@ def _fmt_statement(sym: str) -> str:
         return "—" if v is None else f"{v:,.2f}"
 
     def fmt_ratio(v):
-        return "—" if v is None else f"{v:.2f}x"
+        return "—" if v is None else f"{v:.2f}"
 
     def change(curr, prev):
         if curr is None or prev is None or prev == 0:
