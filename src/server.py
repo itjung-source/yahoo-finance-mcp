@@ -557,6 +557,42 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="scan_weekly_movers",
+            description=(
+                "สแกนหุ้นทุกตัวใน SET/mai หา Top Gainers และ Top Losers รายสัปดาห์\n"
+                "เปรียบเทียบราคาปิดวันศุกร์สัปดาห์นี้กับสัปดาห์ก่อน\n"
+                "แสดง %เปลี่ยนแปลงสัปดาห์นี้, %สัปดาห์ก่อน และ Sector\n"
+                "ใช้ tool นี้เมื่อถามเรื่อง: top gainer/loser of week, หุ้นขึ้นลงสูงสุดประจำสัปดาห์, weekly movers, สแกนหุ้น SET รายสัปดาห์"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "threshold": {
+                        "type": "number",
+                        "default": 5.0,
+                        "description": "% ขั้นต่ำที่จะแสดง (default: 5.0)"
+                    },
+                    "min_price": {
+                        "type": "number",
+                        "default": 0.20,
+                        "description": "ตัดหุ้นราคาต่ำกว่านี้ออก หน่วยบาท (default: 0.20)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 30,
+                        "description": "จำนวนหุ้นสูงสุดที่แสดงแต่ละหัวข้อ (default: 30)"
+                    },
+                    "market": {
+                        "type": "string",
+                        "enum": ["all", "SET", "mai"],
+                        "default": "all",
+                        "description": "กรองตลาด: all, SET, mai (default: all)"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
             name="get_cash_flow",
             description=(
                 "ดึงงบกระแสเงินสด (Cash Flow Statement) ของหุ้นไทยรายตัว\n"
@@ -924,6 +960,129 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 else:
                     line += f"{float(val)/1e6:>15,.1f} "
             lines.append(line)
+
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    # ── scan_weekly_movers ──────────────────────────────────────
+    if name == "scan_weekly_movers":
+        import time
+        threshold  = float(arguments.get("threshold", 5.0))
+        min_price  = float(arguments.get("min_price", 0.20))
+        top_limit  = int(arguments.get("limit", 30))
+        mkt_filter = str(arguments.get("market", "all")).upper()
+
+        # หา 3 วันศุกร์ล่าสุด
+        def last_fridays(n=3):
+            d = datetime.date.today()
+            days_back = (d.weekday() - 4) % 7
+            last_fri = d - datetime.timedelta(days=days_back)
+            return [last_fri - datetime.timedelta(weeks=i) for i in range(n-1, -1, -1)]
+
+        fri_prev2, fri_prev, fri_curr = last_fridays(3)
+
+        # โหลด symbols + sector map
+        con = sqlite3.connect(DB_PATH)
+        if mkt_filter == "ALL":
+            rows = con.execute("SELECT symbol, sector FROM stock_list ORDER BY symbol").fetchall()
+        else:
+            rows = con.execute(
+                "SELECT symbol, sector FROM stock_list WHERE UPPER(market)=? ORDER BY symbol",
+                (mkt_filter,)
+            ).fetchall()
+        con.close()
+        symbols    = [r[0] for r in rows]
+        sector_map = {r[0]: r[1] for r in rows}
+
+        # ดึงราคาปิดย้อนหลัง 1 เดือนจาก Yahoo Finance
+        def fetch_closes(sym: str) -> dict | None:
+            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}.BK?interval=1d&range=1mo"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible)"})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = json.loads(r.read())
+                result = data["chart"]["result"]
+                if not result:
+                    return None
+                timestamps = result[0]["timestamp"]
+                closes     = result[0]["indicators"]["quote"][0]["close"]
+                out = {}
+                for ts, cl in zip(timestamps, closes):
+                    if cl is None:
+                        continue
+                    out[datetime.date.fromtimestamp(ts)] = round(float(cl), 2)
+                return out
+            except Exception:
+                return None
+
+        def get_friday_close(closes: dict, target: datetime.date, tol: int = 2) -> float | None:
+            for delta in range(0, tol + 1):
+                d = target - datetime.timedelta(days=delta)
+                if d in closes:
+                    return closes[d]
+            return None
+
+        def fetch_set_latest(sym: str) -> float | None:
+            url = f"https://www.set.or.th/api/set/stock/quotation/{sym}/info"
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0", "Referer": "https://www.set.or.th/"
+            })
+            try:
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    d = json.loads(r.read())
+                return d.get("priorPrice") or d.get("last") or d.get("closePrice")
+            except Exception:
+                return None
+
+        def process(sym):
+            closes = fetch_closes(sym)
+            if closes is None:
+                return None
+            p2   = get_friday_close(closes, fri_prev2)
+            prev = get_friday_close(closes, fri_prev)
+            curr = get_friday_close(closes, fri_curr)
+            if curr is None:
+                curr = fetch_set_latest(sym)
+            if prev is None or curr is None:
+                return None
+            pct_curr = round((curr - prev) / prev * 100, 2)
+            pct_prev = round((prev - p2) / p2 * 100, 2) if p2 else None
+            return (sym, curr, pct_curr, pct_prev)
+
+        results = []
+        with ThreadPoolExecutor(max_workers=30) as exe:
+            futs = {exe.submit(process, s): s for s in symbols}
+            for fut in as_completed(futs):
+                r = fut.result()
+                if r and r[1] >= min_price and abs(r[2]) >= threshold:
+                    results.append(r)
+
+        # เรียงและแบ่ง gainers/losers
+        gainers = sorted([r for r in results if r[2] > 0], key=lambda x: x[2], reverse=True)
+        losers  = sorted([r for r in results if r[2] < 0], key=lambda x: x[2])
+
+        def fmt_pct(v):
+            return f"{v:>+8.2f}%" if v is not None else f"{'N/A':>9}"
+
+        lines = [
+            f"สแกนหุ้น {len(symbols)} ตัว  ({fri_prev} → {fri_curr})",
+            f"เงื่อนไข: เปลี่ยนแปลง > {threshold}%  |  ราคา ≥ {min_price} บ.  |  ตลาด: {mkt_filter}",
+            f"ขึ้น: {len(gainers)} ตัว  |  ลง: {len(losers)} ตัว",
+            "",
+            f"📈 TOP GAINERS (แสดง {min(len(gainers), top_limit)}/{len(gainers)} ตัว)",
+            f"{'#':<4} {'Symbol':<10} {'ราคาล่าสุด':>11}  {'%สัปดาห์นี้':>12}  {'%สัปดาห์ก่อน':>13}  {'Sector':<10}",
+            "-" * 68,
+        ]
+        for i, (sym, curr, pc, pp) in enumerate(gainers[:top_limit], 1):
+            lines.append(f"{i:<4} {sym:<10} {curr:>11.2f}  {fmt_pct(pc)}  {fmt_pct(pp)}  {sector_map.get(sym,''):<10}")
+
+        lines += [
+            "",
+            f"📉 TOP LOSERS (แสดง {min(len(losers), top_limit)}/{len(losers)} ตัว)",
+            f"{'#':<4} {'Symbol':<10} {'ราคาล่าสุด':>11}  {'%สัปดาห์นี้':>12}  {'%สัปดาห์ก่อน':>13}  {'Sector':<10}",
+            "-" * 68,
+        ]
+        for i, (sym, curr, pc, pp) in enumerate(losers[:top_limit], 1):
+            lines.append(f"{i:<4} {sym:<10} {curr:>11.2f}  {fmt_pct(pc)}  {fmt_pct(pp)}  {sector_map.get(sym,''):<10}")
 
         return [TextContent(type="text", text="\n".join(lines))]
 
