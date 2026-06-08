@@ -983,10 +983,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # โหลด symbols + sector map
         con = sqlite3.connect(DB_PATH)
         if mkt_filter == "ALL":
-            rows = con.execute("SELECT symbol, sector FROM stock_list ORDER BY symbol").fetchall()
+            rows = con.execute("SELECT symbol, name FROM stocks ORDER BY symbol").fetchall()
         else:
             rows = con.execute(
-                "SELECT symbol, sector FROM stock_list WHERE UPPER(market)=? ORDER BY symbol",
+                "SELECT symbol, name FROM stocks WHERE UPPER(market)=? ORDER BY symbol",
                 (mkt_filter,)
             ).fetchall()
         con.close()
@@ -1048,17 +1048,35 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             pct_prev = round((prev - p2) / p2 * 100, 2) if p2 else None
             return (sym, curr, pct_curr, pct_prev)
 
-        results = []
+        # เก็บทุกตัวที่ผ่าน min_price (ยังไม่กรอง threshold)
+        all_results = []
         with ThreadPoolExecutor(max_workers=30) as exe:
             futs = {exe.submit(process, s): s for s in symbols}
             for fut in as_completed(futs):
                 r = fut.result()
-                if r and r[1] >= min_price and abs(r[2]) >= threshold:
-                    results.append(r)
+                if r and r[1] >= min_price:
+                    all_results.append(r)
 
-        # เรียงและแบ่ง gainers/losers
-        gainers = sorted([r for r in results if r[2] > 0], key=lambda x: x[2], reverse=True)
-        losers  = sorted([r for r in results if r[2] < 0], key=lambda x: x[2])
+        # แบ่ง gainers/losers เรียงลำดับ
+        gainers_all = sorted([r for r in all_results if r[2] > 0], key=lambda x: x[2], reverse=True)
+        losers_all  = sorted([r for r in all_results if r[2] < 0], key=lambda x: x[2])
+
+        # กรอง threshold ก่อน ถ้าได้ < top_limit ให้ fill จากที่เหลือจนครบ
+        gainers_thresh = [r for r in gainers_all if r[2] >= threshold]
+        if len(gainers_thresh) < top_limit:
+            shown_gainers = gainers_all[:top_limit]
+            gainer_note = f"(threshold ลดเหลือ {shown_gainers[-1][2]:.2f}% เพื่อให้ครบ {top_limit} ตัว)" if shown_gainers else ""
+        else:
+            shown_gainers = gainers_thresh[:top_limit]
+            gainer_note = ""
+
+        losers_thresh = [r for r in losers_all if r[2] <= -threshold]
+        if len(losers_thresh) < top_limit:
+            shown_losers = losers_all[:top_limit]
+            loser_note = f"(threshold ลดเหลือ {shown_losers[-1][2]:.2f}% เพื่อให้ครบ {top_limit} ตัว)" if shown_losers else ""
+        else:
+            shown_losers = losers_thresh[:top_limit]
+            loser_note = ""
 
         def fmt_pct(v):
             return f"{v:>+8.2f}%" if v is not None else f"{'N/A':>9}"
@@ -1066,23 +1084,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         lines = [
             f"สแกนหุ้น {len(symbols)} ตัว  ({fri_prev} → {fri_curr})",
             f"เงื่อนไข: เปลี่ยนแปลง > {threshold}%  |  ราคา ≥ {min_price} บ.  |  ตลาด: {mkt_filter}",
-            f"ขึ้น: {len(gainers)} ตัว  |  ลง: {len(losers)} ตัว",
+            f"ขึ้น: {len(gainers_all)} ตัว  |  ลง: {len(losers_all)} ตัว",
             "",
-            f"📈 TOP GAINERS (แสดง {min(len(gainers), top_limit)}/{len(gainers)} ตัว)",
-            f"{'#':<4} {'Symbol':<10} {'ราคาล่าสุด':>11}  {'%สัปดาห์นี้':>12}  {'%สัปดาห์ก่อน':>13}  {'Sector':<10}",
+            f"📈 TOP GAINERS (แสดง {len(shown_gainers)}/{len(gainers_all)} ตัว) {gainer_note}",
+            f"{'#':<4} {'Symbol':<10} {'ราคาล่าสุด':>11}  {'%สัปดาห์นี้':>12}  {'%สัปดาห์ก่อน':>13}  {'Name'}",
             "-" * 68,
         ]
-        for i, (sym, curr, pc, pp) in enumerate(gainers[:top_limit], 1):
-            lines.append(f"{i:<4} {sym:<10} {curr:>11.2f}  {fmt_pct(pc)}  {fmt_pct(pp)}  {sector_map.get(sym,''):<10}")
+        for i, (sym, curr, pc, pp) in enumerate(shown_gainers, 1):
+            lines.append(f"{i:<4} {sym:<10} {curr:>11.2f}  {fmt_pct(pc)}  {fmt_pct(pp)}  {sector_map.get(sym,'')}")
 
         lines += [
             "",
-            f"📉 TOP LOSERS (แสดง {min(len(losers), top_limit)}/{len(losers)} ตัว)",
-            f"{'#':<4} {'Symbol':<10} {'ราคาล่าสุด':>11}  {'%สัปดาห์นี้':>12}  {'%สัปดาห์ก่อน':>13}  {'Sector':<10}",
+            f"📉 TOP LOSERS (แสดง {len(shown_losers)}/{len(losers_all)} ตัว) {loser_note}",
+            f"{'#':<4} {'Symbol':<10} {'ราคาล่าสุด':>11}  {'%สัปดาห์นี้':>12}  {'%สัปดาห์ก่อน':>13}  {'Name'}",
             "-" * 68,
         ]
-        for i, (sym, curr, pc, pp) in enumerate(losers[:top_limit], 1):
-            lines.append(f"{i:<4} {sym:<10} {curr:>11.2f}  {fmt_pct(pc)}  {fmt_pct(pp)}  {sector_map.get(sym,''):<10}")
+        for i, (sym, curr, pc, pp) in enumerate(shown_losers, 1):
+            lines.append(f"{i:<4} {sym:<10} {curr:>11.2f}  {fmt_pct(pc)}  {fmt_pct(pp)}  {sector_map.get(sym,'')}")
 
         return [TextContent(type="text", text="\n".join(lines))]
 
