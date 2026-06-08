@@ -12,8 +12,10 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-DB_PATH = "C:/work/AI/SET/set_stocks.db"
-EXECUTOR = ThreadPoolExecutor(max_workers=20)
+DB_PATH        = "C:/work/AI/SET/set_stocks.db"
+EXECUTOR       = ThreadPoolExecutor(max_workers=20)
+SWING_LOOKBACK = 20    # bars before pullback to define swing low
+SWING_THRESH   = 0.03  # near-support = D-1 within 3% above swing low
 
 app = Server("yahoo-finance")
 
@@ -192,6 +194,13 @@ def _scan_one(sym: str, today: str) -> dict:
     if len(past) < 203:
         return {"sym": sym, "status": "insufficient_data"}
 
+    if not today_p:
+        today_p = past[-1]["c"]
+
+    # Filter: ราคา > 0.5 บาท
+    if today_p <= 0.5:
+        return {"sym": sym, "status": "fail_price"}
+
     d1, d2, d3 = past[-1], past[-2], past[-3]
     c2 = (d3["c"] >= d2["c"]) and (d2["c"] >= d1["c"]) and (d3["c"] > d1["c"])
     if not c2:
@@ -199,16 +208,25 @@ def _scan_one(sym: str, today: str) -> dict:
 
     closes = [r["c"] for r in past]
     ema200 = _calc_ema(closes, 200)
-    ema90 = _calc_ema(closes, 90)
+    ema90  = _calc_ema(closes, 90)
     if not ema200 or not ema90:
         return {"sym": sym, "status": "ema_error"}
 
-    if not today_p:
-        today_p = d1["c"]
-
-    c1 = today_p > ema200 and today_p > ema90
+    c1  = today_p > ema200 and today_p > ema90
     c3p = today_p >= d1["c"]
     c3v = today_v > d1["v"]
+
+    # near-support: D-1 ใกล้ swing low 20 แท่งก่อนเริ่ม pullback (ภายใน 3%)
+    near_support   = False
+    swing_gap_pct  = None
+    if len(past) >= 3 + SWING_LOOKBACK:
+        swing_window = past[-(3 + SWING_LOOKBACK):-3]
+        if swing_window:
+            swing_low = min(r["c"] for r in swing_window)
+            if swing_low > 0:
+                gap = (d1["c"] - swing_low) / swing_low
+                swing_gap_pct = round(gap * 100, 1)
+                near_support  = 0 <= gap <= SWING_THRESH
 
     if c1 and c2 and c3p and c3v:
         status = "pass"
@@ -219,6 +237,7 @@ def _scan_one(sym: str, today: str) -> dict:
 
     return {
         "sym": sym, "status": status,
+        "near_support": near_support, "swing_gap_pct": swing_gap_pct,
         "c1": c1, "c2": c2, "c3p": c3p, "c3v": c3v,
         "today_p": round(today_p, 4), "today_v": today_v,
         "ema200": round(ema200, 4), "ema90": round(ema90, 4),
@@ -697,31 +716,45 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elapsed = round(time.time() - t0, 1)
 
+        # sort: near_support first, then alphabetical
+        def sort_key(r):
+            return (0 if r.get("near_support") else 1, r["sym"])
+
+        def support_tag(r):
+            if r.get("near_support"):
+                return f"✅แนวรับ(+{r['swing_gap_pct']}%)"
+            gap = r.get("swing_gap_pct")
+            return f"❌ห่างแนวรับ({gap}%)" if gap is not None else "❌ห่างแนวรับ"
+
         def fmt(r):
             chg = ((r["today_p"] - r["d1"]["c"]) / r["d1"]["c"] * 100) if r["d1"]["c"] else 0
-            vr = r["today_v"] / r["d1"]["v"] * 100 if r["d1"]["v"] else 0
+            vr  = r["today_v"] / r["d1"]["v"] * 100 if r["d1"]["v"] else 0
             return (
-                f"{r['sym']}  p={r['today_p']} ({chg:+.2f}%)  "
-                f"vol={r['today_v']:,} ({vr:.0f}%)  "
-                f"ema200={r['ema200']}  ema90={r['ema90']}\n"
-                f"  d3={r['d3']['dt']}:{r['d3']['c']} > "
-                f"d2={r['d2']['dt']}:{r['d2']['c']} > "
+                f"{r['sym']}  {support_tag(r)}\n"
+                f"  p={r['today_p']} ({chg:+.2f}%)  vol={r['today_v']:,} ({vr:.0f}%)\n"
+                f"  ema200={r['ema200']}  ema90={r['ema90']}\n"
+                f"  d3={r['d3']['dt']}:{r['d3']['c']}  "
+                f"d2={r['d2']['dt']}:{r['d2']['c']}  "
                 f"d1={r['d1']['dt']}:{r['d1']['c']}"
             )
 
+        near_pass    = sum(1 for r in passed  if r.get("near_support"))
+        near_pending = sum(1 for r in pending if r.get("near_support"))
+
         lines = [
             f"สแกน {len(syms)} ตัว ใช้เวลา {elapsed}s  (today={today})",
-            f"\n=== ผ่านครบ 4 เงื่อนไข: {len(passed)} ตัว ===",
+            f"ราคา>0.5บ.  แนวรับ=swing low 20 แท่งภายใน 3%",
+            f"\n=== ผ่านครบ 4 เงื่อนไข: {len(passed)} ตัว (ใกล้แนวรับ {near_pass} ตัว) ===",
         ]
-        for r in sorted(passed, key=lambda x: x["sym"]):
+        for r in sorted(passed, key=sort_key):
             lines.append(fmt(r))
 
-        lines.append(f"\n=== รอ Volume: {len(pending)} ตัว ===")
-        for r in sorted(pending, key=lambda x: x["sym"]):
+        lines.append(f"\n=== รอ Volume: {len(pending)} ตัว (ใกล้แนวรับ {near_pending} ตัว) ===")
+        for r in sorted(pending, key=sort_key):
             vr = r["today_v"] / r["d1"]["v"] * 100 if r["d1"]["v"] else 0
             lines.append(
-                f"{r['sym']}  p={r['today_p']}  "
-                f"vol={r['today_v']:,} ({vr:.0f}%  need>{r['d1']['v']:,})"
+                f"{r['sym']}  {support_tag(r)}\n"
+                f"  p={r['today_p']}  vol={r['today_v']:,} ({vr:.0f}%  need>{r['d1']['v']:,})"
             )
 
         return [TextContent(type="text", text="\n".join(lines))]
