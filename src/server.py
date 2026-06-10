@@ -45,6 +45,19 @@ def _calc_ema(prices: list[float], period: int) -> float | None:
     return ema
 
 
+def _calc_cci(rows_window: list[dict], length: int = 10) -> float | None:
+    """CCI = (TP - SMA_TP) / (0.015 * MeanDev)  where TP = (H+L+C)/3"""
+    if len(rows_window) < length:
+        return None
+    window = rows_window[-length:]
+    tps = [(r["h"] + r["l"] + r["c"]) / 3.0 for r in window]
+    sma = sum(tps) / length
+    mean_dev = sum(abs(tp - sma) for tp in tps) / length
+    if mean_dev == 0:
+        return 0.0
+    return (tps[-1] - sma) / (0.015 * mean_dev)
+
+
 def _fetch_yahoo(sym: str, range_: str = "2y") -> dict:
     url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}.BK?interval=1d&range={range_}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible)"})
@@ -189,7 +202,7 @@ def _scan_one(sym: str, today: str) -> dict:
     if "error" in data:
         return {"sym": sym, "status": "fetch_error", "error": data["error"]}
 
-    past, today_p, today_v = _parse_history(data, today)
+    past, today_p, today_v = _parse_history_ohlcv(data, today)
 
     if len(past) < 203:
         return {"sym": sym, "status": "insufficient_data"}
@@ -228,6 +241,11 @@ def _scan_one(sym: str, today: str) -> dict:
                 swing_gap_pct = round(gap * 100, 1)
                 near_support  = 0 <= gap <= SWING_THRESH
 
+    # CCI(10) ที่ D-1 (last bar of pullback)
+    cci_d1 = _calc_cci(past, 10)
+    if cci_d1 is not None:
+        cci_d1 = round(cci_d1, 1)
+
     if c1 and c2 and c3p and c3v:
         status = "pass"
     elif c1 and c2 and c3p:
@@ -238,6 +256,7 @@ def _scan_one(sym: str, today: str) -> dict:
     return {
         "sym": sym, "status": status,
         "near_support": near_support, "swing_gap_pct": swing_gap_pct,
+        "cci_d1": cci_d1,
         "c1": c1, "c2": c2, "c3p": c3p, "c3v": c3v,
         "today_p": round(today_p, 4), "today_v": today_v,
         "ema200": round(ema200, 4), "ema90": round(ema90, 4),
@@ -726,11 +745,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             gap = r.get("swing_gap_pct")
             return f"❌ห่างแนวรับ({gap}%)" if gap is not None else "❌ห่างแนวรับ"
 
+        def cci_tag(r):
+            v = r.get("cci_d1")
+            if v is None: return "CCI=N/A"
+            flag = "🔴" if v < -100 else ""
+            return f"CCI={flag}{v}"
+
         def fmt(r):
             chg = ((r["today_p"] - r["d1"]["c"]) / r["d1"]["c"] * 100) if r["d1"]["c"] else 0
             vr  = r["today_v"] / r["d1"]["v"] * 100 if r["d1"]["v"] else 0
             return (
-                f"{r['sym']}  {support_tag(r)}\n"
+                f"{r['sym']}  {support_tag(r)}  {cci_tag(r)}\n"
                 f"  p={r['today_p']} ({chg:+.2f}%)  vol={r['today_v']:,} ({vr:.0f}%)\n"
                 f"  ema200={r['ema200']}  ema90={r['ema90']}\n"
                 f"  d3={r['d3']['dt']}:{r['d3']['c']}  "
@@ -753,7 +778,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         for r in sorted(pending, key=sort_key):
             vr = r["today_v"] / r["d1"]["v"] * 100 if r["d1"]["v"] else 0
             lines.append(
-                f"{r['sym']}  {support_tag(r)}\n"
+                f"{r['sym']}  {support_tag(r)}  {cci_tag(r)}\n"
                 f"  p={r['today_p']}  vol={r['today_v']:,} ({vr:.0f}%  need>{r['d1']['v']:,})"
             )
 
