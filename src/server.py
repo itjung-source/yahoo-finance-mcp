@@ -85,43 +85,101 @@ def _parse_history(data: dict, today: str) -> tuple[list[dict], float | None, in
     return past, today_p, today_v
 
 
-def _mover_one(sym: str, today: str) -> dict:
-    """ดึงราคา/volume วันนี้ + prev close เพื่อคำนวณ %change และมูลค่า"""
-    data = _fetch_yahoo(sym, range_="5d")
-    if "error" in data:
-        return {"sym": sym, "ok": False}
+def _parse_history_ohlcv(data: dict, today: str) -> tuple[list[dict], float | None, int]:
+    """Returns (past_rows_with_high_low, today_price, today_volume)"""
     try:
         result = data["chart"]["result"][0]
         meta = result["meta"]
-        timestamps = result.get("timestamp", [])
-        closes = result["indicators"]["quote"][0]["close"]
-        volumes = result["indicators"]["quote"][0]["volume"]
-
-        rows = []
-        for ts, c, v in zip(timestamps, closes, volumes):
-            if c is None or v is None:
-                continue
-            dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%d")
-            rows.append({"dt": dt, "c": float(c), "v": int(v)})
-
-        today_p = float(meta.get("regularMarketPrice") or meta.get("currentPrice") or 0)
-        today_v = int(meta.get("regularMarketVolume") or 0)
-
-        if not today_p or not rows:
-            return {"sym": sym, "ok": False}
-
-        prev_c = float(rows[-1]["c"]) if rows[-1]["dt"] != today else (float(rows[-2]["c"]) if len(rows) >= 2 else 0)
-        if not prev_c:
-            return {"sym": sym, "ok": False}
-
-        pct = (today_p - prev_c) / prev_c * 100
-        value_m = today_p * today_v / 1_000_000
-
-        return {"sym": sym, "ok": True, "price": round(today_p, 4),
-                "pct": round(pct, 2), "value_m": round(value_m, 2),
-                "volume": today_v, "prev_c": round(prev_c, 4)}
+        timestamps = result["timestamp"]
+        q = result["indicators"]["quote"][0]
+        closes  = q["close"]
+        volumes = q["volume"]
+        highs   = q.get("high",  [None] * len(closes))
+        lows    = q.get("low",   [None] * len(closes))
     except Exception:
-        return {"sym": sym, "ok": False}
+        return [], None, 0
+
+    rows = []
+    for ts, c, v, h, l in zip(timestamps, closes, volumes, highs, lows):
+        if c is None or v is None or v == 0:
+            continue
+        dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%d")
+        rows.append({
+            "dt": dt, "c": float(c), "v": int(v),
+            "h": float(h) if h else float(c),
+            "l": float(l) if l else float(c),
+        })
+
+    today_p = meta.get("regularMarketPrice") or meta.get("currentPrice")
+    today_v = int(meta.get("regularMarketVolume") or 0)
+
+    last = rows[-1] if rows else None
+    if last and last["dt"] == today:
+        past = [r for r in rows[:-1] if r["v"] > 0]
+    elif last and today_p and abs(last["c"] - today_p) / today_p < 0.03:
+        past = [r for r in rows[:-1] if r["v"] > 0]
+    else:
+        past = [r for r in rows if r["v"] > 0]
+
+    return past, today_p, today_v
+
+
+def _scan_volatile_one(sym: str, today: str) -> dict:
+    """Scan one stock for volatile-pullback-dry-volume pattern."""
+    data = _fetch_yahoo(sym)
+    if "error" in data:
+        return {"sym": sym, "status": "fetch_error"}
+
+    past, today_p, today_v = _parse_history_ohlcv(data, today)
+    if len(past) < 203:
+        return {"sym": sym, "status": "insufficient_data"}
+    if not today_p:
+        today_p = past[-1]["c"]
+
+    closes = [r["c"] for r in past]
+    ema200 = _calc_ema(closes, 200)
+    ema90  = _calc_ema(closes, 90)
+    if not ema200 or not ema90:
+        return {"sym": sym, "status": "ema_error"}
+
+    # C1: ราคา > EMA200 และ EMA90
+    if not (today_p > ema200 and today_p > ema90):
+        return {"sym": sym, "status": "fail_c1"}
+
+    # C3: ราคาลดจาก High5 > 5%
+    last5  = past[-5:]
+    high5  = max(r["c"] for r in last5)
+    drawdown_pct = (high5 - today_p) / high5 * 100
+    if drawdown_pct <= 5.0:
+        return {"sym": sym, "status": "fail_c3"}
+
+    # C2: Volume แห้ง — วันนี้ <= 30th percentile ของ 20 วัน
+    vols_20 = [r["v"] for r in past[-20:]]
+    vols_sorted = sorted(vols_20)
+    low_vol_thr = vols_sorted[int(len(vols_sorted) * 0.3)]
+    avg_vol_20  = sum(vols_20) / len(vols_20)
+    if today_v > low_vol_thr:
+        return {"sym": sym, "status": "fail_c2"}
+
+    # C4: High20 - Low20 ห่างกัน > 30%
+    last20 = past[-20:]
+    high20 = max(r["h"] for r in last20)
+    low20  = min(r["l"] for r in last20)
+    range_pct = (high20 - low20) / low20 * 100 if low20 > 0 else 0
+    if range_pct <= 30.0:
+        return {"sym": sym, "status": "fail_c4"}
+
+    vol_ratio = round(today_v / avg_vol_20 * 100, 1) if avg_vol_20 else 0
+    return {
+        "sym": sym, "status": "pass",
+        "today_p": round(today_p, 4), "today_v": today_v,
+        "ema200": round(ema200, 4), "ema90": round(ema90, 4),
+        "high5": round(high5, 4), "drawdown_pct": round(drawdown_pct, 2),
+        "avg_vol_20": int(avg_vol_20), "vol_ratio": vol_ratio,
+        "high20": round(high20, 4), "low20": round(low20, 4),
+        "range_pct": round(range_pct, 1),
+        "d_dt": past[-1]["dt"],
+    }
 
 
 def _scan_one(sym: str, today: str) -> dict:
@@ -135,7 +193,7 @@ def _scan_one(sym: str, today: str) -> dict:
         return {"sym": sym, "status": "insufficient_data"}
 
     d1, d2, d3 = past[-1], past[-2], past[-3]
-    c2 = (d3["c"] > d2["c"] + 0.0001) and (d2["c"] > d1["c"] + 0.0001)
+    c2 = (d3["c"] >= d2["c"]) and (d2["c"] >= d1["c"]) and (d3["c"] > d1["c"])
     if not c2:
         return {"sym": sym, "status": "fail_c2"}
 
@@ -170,11 +228,180 @@ def _scan_one(sym: str, today: str) -> dict:
     }
 
 
+# ─── Statement formatter ────────────────────────────────────
+
+def _fmt_statement(sym: str) -> str:
+    """Fetch income statement and format as markdown with YoY and QoQ."""
+    tk = yf.Ticker(f"{sym}.BK")
+    q_df = tk.quarterly_income_stmt
+    a_df = tk.income_stmt
+
+    if (q_df is None or q_df.empty) and (a_df is None or a_df.empty):
+        return f"ไม่พบข้อมูลงบการเงินของ {sym}"
+
+    # Fetch price, P/E, P/BV from info
+    try:
+        info = tk.info or {}
+    except Exception:
+        info = {}
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    pe    = info.get("trailingPE")
+    pbv   = info.get("priceToBook")
+
+    def safe(df, row, col):
+        try:
+            v = df.loc[row, col]
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    def to_m(v):
+        return round(v / 1e6, 1) if v is not None else None
+
+    def fmt_ni(v):
+        if v is None:
+            return "—"
+        return f"({abs(v):,.1f})" if v < 0 else f"{v:,.1f}"
+
+    def fmt_eps(v):
+        return "—" if v is None else f"{v:.2f}"
+
+    def fmt_price(v):
+        return "—" if v is None else f"{v:,.2f}"
+
+    def fmt_ratio(v):
+        return "—" if v is None else f"{v:.2f}"
+
+    def change(curr, prev):
+        if curr is None or prev is None or prev == 0:
+            return "—", "—"
+        if prev < 0 and curr >= 0:
+            return "↑", "พลิกกำไร"
+        if prev >= 0 and curr < 0:
+            return "↓", "พลิกขาดทุน"
+        pct = (curr - prev) / abs(prev) * 100
+        return ("↑" if pct >= 0 else "↓"), f"{pct:+.1f}%"
+
+    # Parse quarterly (newest first)
+    qtrs = []
+    if q_df is not None and not q_df.empty:
+        for col in q_df.columns[:7]:
+            q = (col.month - 1) // 3 + 1
+            qtrs.append({
+                "year": col.year, "q": q,
+                "ni": to_m(safe(q_df, "Net Income", col)),
+                "eps": safe(q_df, "Basic EPS", col),
+            })
+
+    # Parse annual (newest first)
+    annuals = []
+    if a_df is not None and not a_df.empty:
+        for col in a_df.columns[:5]:
+            annuals.append({
+                "year": col.year,
+                "ni": to_m(safe(a_df, "Net Income", col)),
+                "eps": safe(a_df, "Basic EPS", col),
+            })
+
+    qmap = {(d["year"], d["q"]): d for d in qtrs}
+    amap = {d["year"]: d for d in annuals}
+
+    def yoy(d):
+        prev = qmap.get((d["year"] - 1, d["q"]))
+        return change(d["ni"], prev["ni"] if prev else None)
+
+    def qoq(d):
+        pq = d["q"] - 1 if d["q"] > 1 else 4
+        py = d["year"] if d["q"] > 1 else d["year"] - 1
+        prev = qmap.get((py, pq))
+        return change(d["ni"], prev["ni"] if prev else None)
+
+    lines = [f"## {sym} — Net Income & EPS (หน่วย: ล้านบาท)", ""]
+
+    # Latest quarter summary
+    if qtrs:
+        lt = qtrs[0]
+        label = f"Q{lt['q']}/{lt['year']}"
+        ya, yp = yoy(lt)
+        qa, qp = qoq(lt)
+        lines += [
+            f"### ล่าสุด: {label}", "",
+            f"| | | | **{label}** | **EPS** |",
+            "|---|---|---|---:|---:|",
+            f"| **Net Income (M)** | {ya} | YoY {yp} | **{fmt_ni(lt['ni'])}** | **{fmt_eps(lt['eps'])}** |",
+            f"| | {qa} | QoQ {qp} | | |",
+            f"| **ราคา (บาท)** | | | **{fmt_price(price)}** | |",
+            f"| **P/E** | | | **{fmt_ratio(pe)}** | |",
+            f"| **P/BV** | | | **{fmt_ratio(pbv)}** | |",
+            "",
+        ]
+
+    # Quarterly table (Q4→Q1 within each year)
+    lines += [
+        "### รายไตรมาส", "",
+        "| ไตรมาส | | YoY% | QoQ% | Net Income | EPS |",
+        "|---|---|---:|---:|---:|---:|",
+    ]
+
+    years = sorted(set(d["year"] for d in qtrs), reverse=True)
+    shown_ann = set()
+
+    for yr in years:
+        yr_qtrs = sorted([d for d in qtrs if d["year"] == yr], key=lambda x: x["q"], reverse=True)
+        lines.append(f"| **— {yr} —** | | | | | |")
+        for d in yr_qtrs:
+            ya, yp = yoy(d)
+            qa, qp = qoq(d)
+            arrow = ya if ya != "—" else qa
+            lines.append(f"| Q{d['q']} | {arrow} | {yp} | {qp} | {fmt_ni(d['ni'])} | {fmt_eps(d['eps'])} |")
+        # Annual total for this year
+        a = amap.get(yr)
+        if a:
+            prev_a = amap.get(yr - 1)
+            aa, ap = change(a["ni"], prev_a["ni"] if prev_a else None)
+            lines.append(f"| **{yr} รวมปี** | {aa} | **{ap}** | | **{fmt_ni(a['ni'])}** | **{fmt_eps(a['eps'])}** |")
+            shown_ann.add(yr)
+
+    # Annual-only years (older years with no quarterly data)
+    for a in annuals:
+        if a["year"] not in shown_ann:
+            prev_a = amap.get(a["year"] - 1)
+            aa, ap = change(a["ni"], prev_a["ni"] if prev_a else None)
+            lines.append(f"| **{a['year']} รวมปี** | {aa} | **{ap}** | | **{fmt_ni(a['ni'])}** | **{fmt_eps(a['eps'])}** |")
+
+    return "\n".join(lines)
+
+
 # ─── Tools ──────────────────────────────────────────────────
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     return [
+        Tool(
+            name="scan_volatile_pullback_dry_volume",
+            description=(
+                "สแกนหุ้นไทย SET/MAI ทั้งตลาด หาหุ้นขาขึ้น ผันผวนแรง พักตัว Volume แห้ง\n"
+                "เงื่อนไข 4 ข้อ:\n"
+                "  (1) ราคา > EMA200 และ > EMA90\n"
+                "  (2) Volume วันนี้ <= 30th percentile ของ 20 วันทำการล่าสุด\n"
+                "  (3) ราคาต่ำกว่า High ใน 5 วันทำการล่าสุด มากกว่า 5%\n"
+                "  (4) (High20 - Low20) / Low20 > 30%\n"
+                "คืนค่า: เรียงตาม volume แห้งสุด (% of avg) น้อยสุดขึ้นบน"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "market": {
+                        "type": "string",
+                        "enum": ["SET", "mai", "all"],
+                        "default": "all",
+                        "description": "กรองเฉพาะ SET, mai หรือ all"
+                    }
+                }
+            }
+        ),
         Tool(
             name="scan_uptrend_pullback",
             description=(
@@ -250,41 +477,6 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
-            name="scan_daily_movers",
-            description=(
-                "สแกนหุ้นไทย SET/mai ทั้งตลาด หาหุ้นที่วันนี้ราคาเปลี่ยนแปลงและมูลค่าซื้อขายตามเกณฑ์ที่กำหนด\n"
-                "ใช้ tool นี้เมื่อถามเรื่อง: หุ้นบวกมากวันนี้, หุ้นร่วงมากวันนี้, top gainer/loser รายวัน, "
-                "หุ้นที่ขึ้น/ลงเกิน X% วันนี้, สแกนหุ้น SET รายวัน"
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "market": {
-                        "type": "string",
-                        "enum": ["SET", "mai", "all"],
-                        "default": "all",
-                        "description": "กรองตลาด SET, mai หรือ all"
-                    },
-                    "min_pct": {
-                        "type": "number",
-                        "default": 2.9,
-                        "description": "% เปลี่ยนแปลงขั้นต่ำ (บวก=ขึ้น, ลบ=ลง) เช่น 2.9 หรือ -5"
-                    },
-                    "min_value_m": {
-                        "type": "number",
-                        "default": 2.0,
-                        "description": "มูลค่าซื้อขายขั้นต่ำ หน่วยล้านบาท (default: 2.0)"
-                    },
-                    "direction": {
-                        "type": "string",
-                        "enum": ["up", "down", "both"],
-                        "default": "up",
-                        "description": "up=ขึ้น, down=ลง, both=ทั้งสองทิศทาง"
-                    }
-                }
-            }
-        ),
-        Tool(
             name="get_income_statement",
             description=(
                 "ดึงงบกำไรขาดทุน (Income Statement) ของหุ้นไทยรายตัว\n"
@@ -346,6 +538,61 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="get_stock_statement",
+            description=(
+                "แสดงงบกำไรขาดทุนหุ้นไทย พร้อม YoY และ QoQ ในรูปแบบตาราง\n"
+                "คืนค่า: Net Income, EPS รายไตรมาส (Q4→Q1) + รวมปี พร้อม % เปลี่ยนแปลง YoY และ QoQ\n"
+                "ใช้ tool นี้เมื่อต้องการดูภาพรวมงบกำไรขาดทุนแบบ compact\n"
+                "ใช้แทน get_income_statement เมื่อถามเรื่อง: งบหุ้น, แสดงงบ, กำไร YoY QoQ"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "สัญลักษณ์หุ้น เช่น AOT, PTT, KBANK"
+                    }
+                },
+                "required": ["symbol"]
+            }
+        ),
+        Tool(
+            name="scan_weekly_movers",
+            description=(
+                "สแกนหุ้นทุกตัวใน SET/mai หา Top Gainers และ Top Losers รายสัปดาห์\n"
+                "เปรียบเทียบราคาปิดวันศุกร์สัปดาห์นี้กับสัปดาห์ก่อน\n"
+                "แสดง %เปลี่ยนแปลงสัปดาห์นี้, %สัปดาห์ก่อน และ Sector\n"
+                "ใช้ tool นี้เมื่อถามเรื่อง: top gainer/loser of week, หุ้นขึ้นลงสูงสุดประจำสัปดาห์, weekly movers, สแกนหุ้น SET รายสัปดาห์"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "threshold": {
+                        "type": "number",
+                        "default": 5.0,
+                        "description": "% ขั้นต่ำที่จะแสดง (default: 5.0)"
+                    },
+                    "min_price": {
+                        "type": "number",
+                        "default": 0.20,
+                        "description": "ตัดหุ้นราคาต่ำกว่านี้ออก หน่วยบาท (default: 0.20)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 30,
+                        "description": "จำนวนหุ้นสูงสุดที่แสดงแต่ละหัวข้อ (default: 30)"
+                    },
+                    "market": {
+                        "type": "string",
+                        "enum": ["all", "SET", "mai"],
+                        "default": "all",
+                        "description": "กรองตลาด: all, SET, mai (default: all)"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
             name="get_cash_flow",
             description=(
                 "ดึงงบกระแสเงินสด (Cash Flow Statement) ของหุ้นไทยรายตัว\n"
@@ -375,41 +622,6 @@ async def list_tools() -> list[Tool]:
                 "required": ["symbol"]
             }
         ),
-        Tool(
-            name="scan_weekly_movers",
-            description=(
-                "สแกนหุ้นไทย SET/mai ทั้งตลาด หา Top Gainers และ Top Losers รายสัปดาห์\n"
-                "เปรียบเทียบราคาปิดวันศุกร์ 2 สัปดาห์ล่าสุด จาก Yahoo Finance\n"
-                "ใช้ tool นี้เมื่อถามเรื่อง: หุ้นขึ้นมากสัปดาห์นี้, หุ้นร่วงมากสัปดาห์นี้, "
-                "top gainer/loser รายสัปดาห์, weekly top gainers losers"
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "threshold": {
-                        "type": "number",
-                        "default": 5.0,
-                        "description": "% เปลี่ยนแปลงขั้นต่ำ (default 5.0)"
-                    },
-                    "min_price": {
-                        "type": "number",
-                        "default": 0.20,
-                        "description": "ราคาขั้นต่ำ บาท (default 0.20)"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "default": 30,
-                        "description": "จำนวนหุ้นสูงสุดต่อกลุ่ม (default 30)"
-                    },
-                    "market": {
-                        "type": "string",
-                        "enum": ["SET", "mai", "all"],
-                        "default": "all",
-                        "description": "กรองตลาด SET, mai หรือ all"
-                    }
-                }
-            }
-        ),
     ]
 
 
@@ -417,8 +629,50 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     today = datetime.date.today().strftime("%Y-%m-%d")
 
+    # ── scan_volatile_pullback_dry_volume ───────────────────
+    if name == "scan_volatile_pullback_dry_volume":
+        import time
+        market = arguments.get("market", "all")
+        syms = _load_symbols(None if market == "all" else market)
+        t0 = time.time()
+
+        results_list = []
+        loop = asyncio.get_event_loop()
+        futures_map = {
+            loop.run_in_executor(EXECUTOR, _scan_volatile_one, sym, today): sym
+            for sym in syms
+        }
+        raw = await asyncio.gather(*futures_map.keys(), return_exceptions=True)
+        for r in raw:
+            if isinstance(r, Exception):
+                continue
+            if r["status"] == "pass":
+                results_list.append(r)
+
+        elapsed = round(time.time() - t0, 1)
+        results_list.sort(key=lambda x: x["vol_ratio"])
+
+        lines = [
+            f"สแกน {len(syms)} ตัว ใช้เวลา {elapsed}s  (today={today})",
+            f"ผ่าน 4 เงื่อนไข: {len(results_list)} ตัว — เรียงตาม Volume แห้งสุด",
+            "",
+            f"{'หุ้น':8s}  {'ราคา':>8s}  {'ลง High5':>9s}  {'Range20d':>9s}  {'Low20':>7s}  {'High20':>7s}  {'Volume':>12s}  {'%avg':>5s}",
+            "-" * 78,
+        ]
+        for r in results_list:
+            lines.append(
+                f"{r['sym']:8s}  {r['today_p']:>8.4f}  {r['drawdown_pct']:>7.1f}%  "
+                f"{r['range_pct']:>8.1f}%  {r['low20']:>7.4f}  {r['high20']:>7.4f}  "
+                f"{r['today_v']:>12,}  {r['vol_ratio']:>4.0f}%"
+            )
+            lines.append(
+                f"{'':8s}  EMA200={r['ema200']:.4f}  EMA90={r['ema90']:.4f}  ข้อมูลถึง={r['d_dt']}"
+            )
+
+        return [TextContent(type="text", text="\n".join(lines))]
+
     # ── scan_uptrend_pullback ────────────────────────────────
-    if name == "scan_uptrend_pullback":
+    elif name == "scan_uptrend_pullback":
         market = arguments.get("market", "all")
         syms = _load_symbols(None if market == "all" else market)
         import time
@@ -558,54 +812,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
         return [TextContent(type="text", text=text)]
 
-    # ── scan_daily_movers ────────────────────────────────────
-    elif name == "scan_daily_movers":
-        import time
-        market    = arguments.get("market", "all")
-        min_pct   = float(arguments.get("min_pct", 2.9))
-        min_val   = float(arguments.get("min_value_m", 2.0))
-        direction = arguments.get("direction", "up")
-
-        syms = _load_symbols(None if market == "all" else market)
-        t0 = time.time()
-
-        loop = asyncio.get_event_loop()
-        futures = [loop.run_in_executor(EXECUTOR, _mover_one, sym, today) for sym in syms]
-        raw = await asyncio.gather(*futures, return_exceptions=True)
-
-        results = []
-        for r in raw:
-            if isinstance(r, Exception) or not r.get("ok"):
-                continue
-            pct = r["pct"]
-            if r["value_m"] < min_val:
-                continue
-            if direction == "up" and pct < min_pct:
-                continue
-            if direction == "down" and pct > -abs(min_pct):
-                continue
-            if direction == "both" and abs(pct) < abs(min_pct):
-                continue
-            results.append(r)
-
-        results.sort(key=lambda x: x["pct"], reverse=True)
-        elapsed = round(time.time() - t0, 1)
-
-        lines = [
-            f"สแกน {len(syms)} ตัว ใช้เวลา {elapsed}s  (today={today})",
-            f"เงื่อนไข: %change {'≥' if direction != 'down' else '≤'} {min_pct}%  |  มูลค่า ≥ {min_val} ลบ.  |  ทิศทาง: {direction}",
-            f"พบ {len(results)} หุ้น\n",
-            f"{'หุ้น':<10} {'ราคา':>8} {'%เปลี่ยน':>10} {'มูลค่า(ลบ.)':>13} {'Volume':>13}",
-            "-" * 58,
-        ]
-        for r in results:
-            sign = "🟢" if r["pct"] > 0 else "🔴"
-            lines.append(
-                f"{r['sym']:<10} {r['price']:>8.2f} {sign}{r['pct']:>+7.2f}%  "
-                f"{r['value_m']:>12,.2f}  {r['volume']:>13,}"
-            )
-
-        return [TextContent(type="text", text="\n".join(lines))]
+    # ── get_stock_statement ─────────────────────────────────
+    elif name == "get_stock_statement":
+        sym = arguments["symbol"].upper()
+        text = _fmt_statement(sym)
+        return [TextContent(type="text", text=text)]
 
     # ── get_income_statement ────────────────────────────────
     elif name == "get_income_statement":
@@ -749,6 +960,147 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 else:
                     line += f"{float(val)/1e6:>15,.1f} "
             lines.append(line)
+
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    # ── scan_weekly_movers ──────────────────────────────────────
+    if name == "scan_weekly_movers":
+        import time
+        threshold  = float(arguments.get("threshold", 5.0))
+        min_price  = float(arguments.get("min_price", 0.20))
+        top_limit  = int(arguments.get("limit", 30))
+        mkt_filter = str(arguments.get("market", "all")).upper()
+
+        # หา 3 วันศุกร์ล่าสุด
+        def last_fridays(n=3):
+            d = datetime.date.today()
+            days_back = (d.weekday() - 4) % 7
+            last_fri = d - datetime.timedelta(days=days_back)
+            return [last_fri - datetime.timedelta(weeks=i) for i in range(n-1, -1, -1)]
+
+        fri_prev2, fri_prev, fri_curr = last_fridays(3)
+
+        # โหลด symbols + sector map
+        con = sqlite3.connect(DB_PATH)
+        if mkt_filter == "ALL":
+            rows = con.execute("SELECT symbol, name FROM stocks ORDER BY symbol").fetchall()
+        else:
+            rows = con.execute(
+                "SELECT symbol, name FROM stocks WHERE UPPER(market)=? ORDER BY symbol",
+                (mkt_filter,)
+            ).fetchall()
+        con.close()
+        symbols    = [r[0] for r in rows]
+        sector_map = {r[0]: r[1] for r in rows}
+
+        # ดึงราคาปิดย้อนหลัง 1 เดือนจาก Yahoo Finance
+        def fetch_closes(sym: str) -> dict | None:
+            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}.BK?interval=1d&range=1mo"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible)"})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = json.loads(r.read())
+                result = data["chart"]["result"]
+                if not result:
+                    return None
+                timestamps = result[0]["timestamp"]
+                closes     = result[0]["indicators"]["quote"][0]["close"]
+                out = {}
+                for ts, cl in zip(timestamps, closes):
+                    if cl is None:
+                        continue
+                    out[datetime.date.fromtimestamp(ts)] = round(float(cl), 2)
+                return out
+            except Exception:
+                return None
+
+        def get_friday_close(closes: dict, target: datetime.date, tol: int = 2) -> float | None:
+            for delta in range(0, tol + 1):
+                d = target - datetime.timedelta(days=delta)
+                if d in closes:
+                    return closes[d]
+            return None
+
+        def fetch_set_latest(sym: str) -> float | None:
+            url = f"https://www.set.or.th/api/set/stock/quotation/{sym}/info"
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0", "Referer": "https://www.set.or.th/"
+            })
+            try:
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    d = json.loads(r.read())
+                return d.get("priorPrice") or d.get("last") or d.get("closePrice")
+            except Exception:
+                return None
+
+        def process(sym):
+            closes = fetch_closes(sym)
+            if closes is None:
+                return None
+            p2   = get_friday_close(closes, fri_prev2)
+            prev = get_friday_close(closes, fri_prev)
+            curr = get_friday_close(closes, fri_curr)
+            if curr is None:
+                curr = fetch_set_latest(sym)
+            if prev is None or curr is None:
+                return None
+            pct_curr = round((curr - prev) / prev * 100, 2)
+            pct_prev = round((prev - p2) / p2 * 100, 2) if p2 else None
+            return (sym, curr, pct_curr, pct_prev)
+
+        # เก็บทุกตัวที่ผ่าน min_price (ยังไม่กรอง threshold)
+        all_results = []
+        with ThreadPoolExecutor(max_workers=30) as exe:
+            futs = {exe.submit(process, s): s for s in symbols}
+            for fut in as_completed(futs):
+                r = fut.result()
+                if r and r[1] >= min_price:
+                    all_results.append(r)
+
+        # แบ่ง gainers/losers เรียงลำดับ
+        gainers_all = sorted([r for r in all_results if r[2] > 0], key=lambda x: x[2], reverse=True)
+        losers_all  = sorted([r for r in all_results if r[2] < 0], key=lambda x: x[2])
+
+        # กรอง threshold ก่อน ถ้าได้ < top_limit ให้ fill จากที่เหลือจนครบ
+        gainers_thresh = [r for r in gainers_all if r[2] >= threshold]
+        if len(gainers_thresh) < top_limit:
+            shown_gainers = gainers_all[:top_limit]
+            gainer_note = f"(threshold ลดเหลือ {shown_gainers[-1][2]:.2f}% เพื่อให้ครบ {top_limit} ตัว)" if shown_gainers else ""
+        else:
+            shown_gainers = gainers_thresh[:top_limit]
+            gainer_note = ""
+
+        losers_thresh = [r for r in losers_all if r[2] <= -threshold]
+        if len(losers_thresh) < top_limit:
+            shown_losers = losers_all[:top_limit]
+            loser_note = f"(threshold ลดเหลือ {shown_losers[-1][2]:.2f}% เพื่อให้ครบ {top_limit} ตัว)" if shown_losers else ""
+        else:
+            shown_losers = losers_thresh[:top_limit]
+            loser_note = ""
+
+        def fmt_pct(v):
+            return f"{v:>+8.2f}%" if v is not None else f"{'N/A':>9}"
+
+        lines = [
+            f"สแกนหุ้น {len(symbols)} ตัว  ({fri_prev} → {fri_curr})",
+            f"เงื่อนไข: เปลี่ยนแปลง > {threshold}%  |  ราคา ≥ {min_price} บ.  |  ตลาด: {mkt_filter}",
+            f"ขึ้น: {len(gainers_all)} ตัว  |  ลง: {len(losers_all)} ตัว",
+            "",
+            f"📈 TOP GAINERS (แสดง {len(shown_gainers)}/{len(gainers_all)} ตัว) {gainer_note}",
+            f"{'#':<4} {'Symbol':<10} {'ราคาล่าสุด':>11}  {'%สัปดาห์นี้':>12}  {'%สัปดาห์ก่อน':>13}  {'Name'}",
+            "-" * 68,
+        ]
+        for i, (sym, curr, pc, pp) in enumerate(shown_gainers, 1):
+            lines.append(f"{i:<4} {sym:<10} {curr:>11.2f}  {fmt_pct(pc)}  {fmt_pct(pp)}  {sector_map.get(sym,'')}")
+
+        lines += [
+            "",
+            f"📉 TOP LOSERS (แสดง {len(shown_losers)}/{len(losers_all)} ตัว) {loser_note}",
+            f"{'#':<4} {'Symbol':<10} {'ราคาล่าสุด':>11}  {'%สัปดาห์นี้':>12}  {'%สัปดาห์ก่อน':>13}  {'Name'}",
+            "-" * 68,
+        ]
+        for i, (sym, curr, pc, pp) in enumerate(shown_losers, 1):
+            lines.append(f"{i:<4} {sym:<10} {curr:>11.2f}  {fmt_pct(pc)}  {fmt_pct(pp)}  {sector_map.get(sym,'')}")
 
         return [TextContent(type="text", text="\n".join(lines))]
 
